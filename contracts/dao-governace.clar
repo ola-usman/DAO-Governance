@@ -133,3 +133,172 @@
     ERR-NOT-MEMBER
   )
 )
+
+;; ======================
+;; Public Functions
+;; ======================
+
+;; Membership Management
+(define-public (join-dao)
+  (let (
+    (caller tx-sender)
+  )
+    (asserts! (not (is-member caller)) ERR-ALREADY-MEMBER)
+    (map-set members caller {reputation: u1, stake: u0, last-interaction: block-height})
+    (var-set total-members (+ (var-get total-members) u1))
+    (ok true)
+  )
+)
+
+(define-public (leave-dao)
+  (let (
+    (caller tx-sender)
+  )
+    (asserts! (is-member caller) ERR-NOT-MEMBER)
+    (map-delete members caller)
+    (var-set total-members (- (var-get total-members) u1))
+    (ok true)
+  )
+)
+
+;; Staking Functions
+(define-public (stake-tokens (amount uint))
+  (let (
+    (caller tx-sender)
+  )
+    (asserts! (is-member caller) ERR-NOT-MEMBER)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (try! (stx-transfer? amount caller (as-contract tx-sender)))
+    (match (map-get? members caller)
+      member-data 
+      (let (
+        (new-stake (+ (get stake member-data) amount))
+        (updated-data (merge member-data {stake: new-stake, last-interaction: block-height}))
+      )
+        (map-set members caller updated-data)
+        (var-set treasury-balance (+ (var-get treasury-balance) amount))
+        (ok new-stake)
+      )
+      ERR-NOT-MEMBER
+    )
+  )
+)
+
+(define-public (unstake-tokens (amount uint))
+  (let (
+    (caller tx-sender)
+  )
+    (asserts! (is-member caller) ERR-NOT-MEMBER)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (match (map-get? members caller)
+      member-data 
+      (let (
+        (current-stake (get stake member-data))
+      )
+        (asserts! (>= current-stake amount) ERR-INSUFFICIENT-FUNDS)
+        (try! (as-contract (stx-transfer? amount tx-sender caller)))
+        (let (
+          (new-stake (- current-stake amount))
+          (updated-data (merge member-data {stake: new-stake, last-interaction: block-height}))
+        )
+          (map-set members caller updated-data)
+          (var-set treasury-balance (- (var-get treasury-balance) amount))
+          (ok new-stake)
+        )
+      )
+      ERR-NOT-MEMBER
+    )
+  )
+)
+
+;; Proposal Management
+(define-public (create-proposal (title (string-ascii 50)) (description (string-utf8 500)) (amount uint))
+  (let (
+    (caller tx-sender)
+    (proposal-id (+ (var-get total-proposals) u1))
+  )
+    (asserts! (is-member caller) ERR-NOT-MEMBER)
+    (asserts! (>= (var-get treasury-balance) amount) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (> (len title) u0) ERR-INVALID-PROPOSAL)
+    (asserts! (> (len description) u0) ERR-INVALID-PROPOSAL)
+    (map-set proposals proposal-id
+      {
+        creator: caller,
+        title: title,
+        description: description,
+        amount: amount,
+        yes-votes: u0,
+        no-votes: u0,
+        status: "active",
+        created-at: block-height,
+        expires-at: (+ block-height u1440)
+      }
+    )
+    (var-set total-proposals proposal-id)
+    (try! (update-member-reputation caller 1))
+    (ok proposal-id)
+  )
+)
+
+;; Voting System
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+  (let (
+    (caller tx-sender)
+  )
+    (asserts! (is-member caller) ERR-NOT-MEMBER)
+    (asserts! (is-active-proposal proposal-id) ERR-INVALID-PROPOSAL)
+    (asserts! (not (default-to false (map-get? votes {proposal-id: proposal-id, voter: caller}))) ERR-ALREADY-VOTED)
+    
+    (let (
+      (voting-power (calculate-voting-power caller))
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+    )
+      (if vote
+        (map-set proposals proposal-id (merge proposal {yes-votes: (+ (get yes-votes proposal) voting-power)}))
+        (map-set proposals proposal-id (merge proposal {no-votes: (+ (get no-votes proposal) voting-power)}))
+      )
+      (map-set votes {proposal-id: proposal-id, voter: caller} true)
+      (try! (update-member-reputation caller 1))
+      (ok true)
+    )
+  )
+)
+
+;; Proposal Execution
+(define-public (execute-proposal (proposal-id uint))
+  (let (
+    (caller tx-sender)
+  )
+    (asserts! (is-member caller) ERR-NOT-MEMBER)
+    (asserts! (is-valid-proposal-id proposal-id) ERR-INVALID-PROPOSAL)
+    (match (map-get? proposals proposal-id)
+      proposal 
+      (begin
+        (asserts! (>= block-height (get expires-at proposal)) ERR-PROPOSAL-EXPIRED)
+        (asserts! (is-eq (get status proposal) "active") ERR-INVALID-PROPOSAL)
+        (let (
+          (yes-votes (get yes-votes proposal))
+          (no-votes (get no-votes proposal))
+          (amount (get amount proposal))
+        )
+          (if (> yes-votes no-votes)
+            (begin
+              (try! (as-contract (stx-transfer? amount tx-sender (get creator proposal))))
+              (var-set treasury-balance (- (var-get treasury-balance) amount))
+              (asserts! (is-valid-proposal-id proposal-id) ERR-INVALID-PROPOSAL)
+              (map-set proposals proposal-id (merge proposal {status: "executed"}))
+              (try! (update-member-reputation (get creator proposal) 5))
+              (ok true)
+            )
+            (begin
+              (asserts! (is-valid-proposal-id proposal-id) ERR-INVALID-PROPOSAL)
+              (map-set proposals proposal-id (merge proposal {status: "rejected"}))
+              (ok false)
+            )
+          )
+        )
+      )
+      ERR-INVALID-PROPOSAL
+    )
+  )
+)
